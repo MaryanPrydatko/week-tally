@@ -23,6 +23,7 @@
 - **Track any event by name** — `work` matches `Work`, `Deep Work`, `Work: calls` (case-insensitive substring)
 - **Weekly targets** — "30h of work, 3h of gym" → progress bars turn green when you hit them
 - **Floating widget on calendar.google.com** — your week's progress always visible, collapsible to a pill
+- **Refresh button in the widget corner** — pulls fresh numbers on the spot instead of waiting out the cache
 - **History** — last 4 weeks + average per tracked event in the popup
 - No OAuth, no API keys — reads your calendar's **secret iCal URL**. No background tracking, no analytics.
 
