@@ -187,6 +187,56 @@ check((await widget.locator('.gtt-pill').count()) === 1, 'widget collapses to pi
 await widget.locator('.gtt-pill').click();
 check((await widget.locator('.gtt-card').count()) === 1, 'pill expands back to card');
 
+// --- 3b. manual refresh button in the bottom corner -----------------------
+check(
+  (await widget.locator('#gtt-widget .gtt-foot .gtt-refresh').count()) === 1,
+  'widget has a refresh button in the footer'
+);
+check(
+  (await widget.locator('.gtt-refresh .gtt-icon').innerText()) === '↻',
+  'refresh button renders the ↻ glyph'
+);
+check(
+  (await widget.locator('.gtt-refresh').getAttribute('title')) === 'Refresh now',
+  'refresh button carries a tooltip'
+);
+// A second feed payload with a different total, so a refresh that fetches and
+// discards its result cannot pass: the current week goes from 10h to 12h.
+const icsV2 = ics.replace(`DTEND:${fmt(oneOffEnd)}`, `DTEND:${fmt(at(cur, 2, 18))}`);
+await widget.evaluate(
+  (payload) => {
+    window.__origFetch = window.fetch;
+    window.__restoreFetch = () => {
+      window.fetch = window.__origFetch;
+    };
+    window.__fetches = 0;
+    // The wrapper is installed after the initial page load, so every call that
+    // goes through it is the manual refresh and gets the new payload.
+    window.fetch = async () => {
+      window.__fetches += 1;
+      return { ok: true, text: async () => payload.second };
+    };
+  },
+  { first: ics, second: icsV2 }
+);
+const fetchesBefore = await widget.evaluate(() => window.__fetches);
+await widget.locator('.gtt-refresh').click();
+await widget.waitForFunction(() => !document.querySelector('.gtt-refresh').disabled);
+const fetchesAfter = await widget.evaluate(() => window.__fetches);
+check(
+  fetchesAfter - fetchesBefore === 1,
+  `one click re-fetches the feed exactly once (got ${fetchesAfter - fetchesBefore})`
+);
+check(
+  (await widget.locator('.gtt-value').first().innerText()) === '12 / 30h · −18h',
+  `the refreshed feed result is applied (got "${await widget.locator('.gtt-value').first().innerText()}")`
+);
+await widget.evaluate(() => window.__restoreFetch());
+check(
+  (await widget.locator('.gtt-foot .gtt-note').count()) === 0,
+  'feed mode keeps the footer to the button alone'
+);
+
 // --- 4. page-reading (DOM) mode -------------------------------------------
 const datekey = (d) =>
   ((d.getFullYear() - 1970) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
@@ -274,6 +324,40 @@ const domWidgetWork = await dom.locator('.gtt-value').first().innerText();
 check(domWidgetWork === '6.8 / 20h · −13.3h', `dom-mode widget shows work progress (got "${domWidgetWork}")`);
 const domNote = await dom.locator('.gtt-note').innerText();
 check(/page mode · 3 events read/.test(domNote), `dom-mode widget shows read counter (got "${domNote}")`);
+
+// --- 4a. refresh button works in page-reading mode too --------------------
+check(
+  (await dom.locator('#gtt-widget .gtt-foot .gtt-refresh').count()) === 1,
+  'page-mode widget has the refresh button'
+);
+await dom.evaluate(() => {
+  const original = CalDom.scan;
+  window.__scans = 0;
+  CalDom.scan = (...args) => {
+    window.__scans += 1;
+    return original(...args);
+  };
+});
+const domBusy = await dom.evaluate(() => {
+  const before = window.__scans;
+  document.querySelector('.gtt-refresh').click();
+  const btn = document.querySelector('.gtt-refresh');
+  const note = document.querySelector('.gtt-foot .gtt-note');
+  return { before, disabled: btn.disabled, note: note ? note.textContent : '' };
+});
+check(domBusy.disabled, 'page-mode button goes busy on click');
+check(/rescanning the grid/.test(domBusy.note), `page-mode busy note shows (got "${domBusy.note}")`);
+await dom.waitForFunction(() => !document.querySelector('.gtt-refresh').disabled);
+const domDelta = await dom.evaluate((before) => window.__scans - before, domBusy.before);
+check(domDelta === 1, `one click rescans the grid exactly once (got ${domDelta})`);
+check(
+  /^page mode · 3 events read in view$/.test(await dom.locator('.gtt-foot .gtt-note').innerText()),
+  'page-mode note returns to the read counter'
+);
+check(
+  domWidgetWork === (await dom.locator('.gtt-value').first().innerText()),
+  'page-mode numbers survive a manual refresh'
+);
 
 // --- 4b. widget follows the viewed week (going back a week) ----------------
 const prevMon = at(cur, -7, 0);
@@ -379,6 +463,14 @@ check(await popupDom.locator('#domSection').isVisible(), 'source section visible
 check(await popupDom.locator('#refreshGcal').isVisible(), 'refresh-from-Google button available in dom mode');
 
 // --- 6. widget on Notion Calendar (renders from shared GCal data) ----------
+const monNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const notionTitle = (d1, d2) => {
+  if (d1.getFullYear() !== d2.getFullYear())
+    return `${d1.getDate()} ${monNames[d1.getMonth()]} ${d1.getFullYear()} – ${d2.getDate()} ${monNames[d2.getMonth()]} ${d2.getFullYear()} · Notion Calendar`;
+  if (d1.getMonth() !== d2.getMonth())
+    return `${d1.getDate()} ${monNames[d1.getMonth()]} – ${d2.getDate()} ${monNames[d2.getMonth()]} ${d1.getFullYear()} · Notion Calendar`;
+  return `${d1.getDate()} – ${d2.getDate()} ${monNames[d1.getMonth()]} ${d1.getFullYear()} · Notion Calendar`;
+};
 const notion = await browser.newPage();
 notion.on('pageerror', (e) => errors.push(String(e)));
 await notion.route('**/*', (r) => r.fulfill({ contentType: 'text/html', body: '<body></body>' }));
@@ -401,9 +493,16 @@ await notion.addInitScript(`
         },
         set: async (o) => Object.assign(localStore, o),
       },
-      onChanged: { addListener: () => {} },
+      onChanged: { addListener: (fn) => { window.__onChanged = fn; } },
     },
-    runtime: { getManifest: () => ({ version: '1.0.0' }) },
+    runtime: {
+      getManifest: () => ({ version: '1.0.0' }),
+      sendMessage: (msg) => {
+        window.__sent = window.__sent || [];
+        window.__sent.push(msg);
+        return Promise.resolve({ ok: true });
+      },
+    },
   };
 `);
 await notion.goto('https://calendar.notion.so/');
@@ -417,6 +516,237 @@ const notionValue = await notion.locator('.gtt-value').first().innerText();
 check(notionValue === '4 / 20h · −16h', `notion widget shows GCal-fed hours (got "${notionValue}")`);
 const notionNote = await notion.locator('.gtt-note').innerText();
 check(/from Google Calendar/.test(notionNote), `notion widget labels its data source (got "${notionNote}")`);
+
+// --- 6a. the Notion refresh button asks for a fresh Google scan -----------
+check(
+  (await notion.locator('#gtt-widget .gtt-foot .gtt-refresh').count()) === 1,
+  'notion widget has the refresh button'
+);
+const sentBefore = await notion.evaluate(() => (window.__sent || []).length);
+await notion.locator('.gtt-refresh').click();
+await notion.waitForTimeout(200);
+const asked = (await notion.evaluate(() => window.__sent || [])) || [];
+const manual = asked.slice(sentBefore);
+check(
+  manual.length === 1 && manual[0].type === 'gtt-refresh-gcal',
+  `one click sends exactly one refresh request (got ${JSON.stringify(manual)})`
+);
+check(
+  /^\d{4}\/\d{1,2}\/\d{1,2}$/.test(manual[0]?.week || ''),
+  `week string matches the background worker's contract (got "${manual[0]?.week}")`
+);
+const roundTrip = await notion.evaluate((week) => {
+  const [y, m, d] = week.split('/').map(Number);
+  return CalHours.weekStart(new Date(y, m - 1, d)).getTime();
+}, manual[0]?.week || '');
+check(roundTrip === +cur, `the requested week parses back to the viewed Monday (got ${new Date(roundTrip).toDateString()})`);
+check(
+  /refreshing/.test(await notion.locator('.gtt-foot .gtt-note').innerText()),
+  'notion note shows the refreshing state'
+);
+check(await notion.locator('.gtt-refresh').isDisabled(), 'refresh button is disabled while refreshing');
+check(
+  /gtt-busy/.test(await notion.locator('.gtt-refresh').getAttribute('class')),
+  'refresh button gets the busy class for the spinner'
+);
+check(
+  (await notion.locator('.gtt-refresh').getAttribute('aria-label')) === 'Refreshing…',
+  'busy state is announced, not just drawn'
+);
+
+// Fresh data landing clears the spinner and restores the source line.
+await notion.evaluate((ts) => {
+  window.__onChanged(
+    {
+      gttDomWeeks: { newValue: { [ts]: [{ s: ts + 36e5, e: ts + 72e5, m: 'work' }] } },
+      gttDomWeeksAt: { newValue: Date.now() },
+    },
+    'local'
+  );
+}, +cur);
+await notion.waitForTimeout(250);
+check(!(await notion.locator('.gtt-refresh').isDisabled()), 'refresh button re-enables once fresh data lands');
+const noteAfter = await notion.locator('.gtt-foot .gtt-note').innerText();
+check(
+  /^from Google Calendar · /.test(noteAfter) && !/refreshing/.test(noteAfter),
+  `note returns to the source line after the refresh lands (got "${noteAfter}")`
+);
+
+// Data for a DIFFERENT week must not end the pending state early.
+await notion.locator('.gtt-refresh').click();
+await notion.waitForTimeout(150);
+await notion.evaluate((ts) => {
+  window.__onChanged(
+    {
+      gttDomWeeks: { newValue: { [ts]: [{ s: ts + 36e5, e: ts + 72e5, m: 'work' }] } },
+      gttDomWeeksAt: { newValue: Date.now() },
+    },
+    'local'
+  );
+}, +at(cur, 7, 0));
+await notion.waitForTimeout(150);
+check(
+  await notion.locator('.gtt-refresh').isDisabled(),
+  'another week landing does not clear the pending spinner'
+);
+await notion.evaluate((ts) => {
+  window.__onChanged(
+    {
+      gttDomWeeks: { newValue: { [ts]: [{ s: ts + 36e5, e: ts + 108e5, m: 'work' }] } },
+      gttDomWeeksAt: { newValue: Date.now() },
+    },
+    'local'
+  );
+}, +cur);
+await notion.waitForTimeout(200);
+check(!(await notion.locator('.gtt-refresh').isDisabled()), 'the viewed week landing does clear it');
+// --- 6c. the button asks for the week being viewed, not today -------------
+const otherWeek = at(cur, -14, 0);
+const otherWeekSun = at(cur, -8, 0);
+const other = await browser.newPage();
+other.on('pageerror', (e) => errors.push(String(e)));
+await other.route('**/*', (r) =>
+  r.fulfill({
+    contentType: 'text/html',
+    body: `<head><title>${notionTitle(otherWeek, otherWeekSun)}</title></head><body></body>`,
+  })
+);
+await other.addInitScript(`
+  const localStore = {
+    gttDomWeeks: ${JSON.stringify({ [+otherWeek]: [{ s: +at(cur, -14, 9), e: +at(cur, -14, 17), m: 'work' }] })},
+    gttDomWeeksAt: Date.now(),
+  };
+  window.chrome = {
+    storage: {
+      sync: {
+        get: async (d) => ({ ...d, source: 'dom', tracked: [{ name: 'work', target: 20 }] }),
+        set: async () => {},
+      },
+      local: {
+        get: async (k) => {
+          if (typeof k === 'string') return { [k]: localStore[k] };
+          if (Array.isArray(k)) return Object.fromEntries(k.map((key) => [key, localStore[key]]));
+          return { ...k, ...localStore };
+        },
+        set: async (o) => Object.assign(localStore, o),
+      },
+      onChanged: { addListener: () => {} },
+    },
+    runtime: {
+      getManifest: () => ({ version: '1.0.0' }),
+      sendMessage: (msg) => {
+        window.__sent = window.__sent || [];
+        window.__sent.push(msg);
+        return Promise.resolve({ ok: true });
+      },
+    },
+  };
+`);
+await other.goto('https://calendar.notion.so/');
+for (const f of ['vendor/ical.min.js', 'lib/hours.js', 'dom-reader.js', 'content.js']) {
+  await other.addScriptTag({ path: path.join(root, f) });
+}
+await other.addStyleTag({ path: path.join(root, 'content.css') });
+await other.waitForTimeout(400);
+check(
+  /^Week of /.test(await other.locator('.gtt-head strong').innerText()),
+  'notion widget is showing a week that is not the current one (setup for the check below)'
+);
+await other.locator('.gtt-refresh').click();
+await other.waitForTimeout(200);
+const otherSent = (await other.evaluate(() => window.__sent || [])) || [];
+const wantOther = `${otherWeek.getFullYear()}/${otherWeek.getMonth() + 1}/${otherWeek.getDate()}`;
+check(
+  otherSent.at(-1)?.week === wantOther,
+  `click asks for the viewed week, not today (want ${wantOther}, got ${JSON.stringify(otherSent)})`
+);
+
+// --- 6d. a dead extension context must not latch the button ---------------
+const broken = await browser.newPage();
+broken.on('pageerror', (e) => errors.push(String(e)));
+await broken.route('**/*', (r) => r.fulfill({ contentType: 'text/html', body: '<body></body>' }));
+await broken.addInitScript(`
+  window.chrome = {
+    storage: {
+      sync: {
+        get: async (d) => ({ ...d, source: 'dom', tracked: [{ name: 'work', target: 20 }] }),
+        set: async () => {},
+      },
+      local: { get: async () => ({}), set: async () => {} },
+      onChanged: { addListener: () => {} },
+    },
+    runtime: {
+      getManifest: () => ({ version: '1.0.0' }),
+      sendMessage: () => {
+        throw new Error('Extension context invalidated.');
+      },
+    },
+  };
+`);
+await broken.goto('https://calendar.notion.so/');
+for (const f of ['vendor/ical.min.js', 'lib/hours.js', 'dom-reader.js', 'content.js']) {
+  await broken.addScriptTag({ path: path.join(root, f) });
+}
+await broken.addStyleTag({ path: path.join(root, 'content.css') });
+await broken.waitForTimeout(300);
+await broken.locator('.gtt-refresh').click();
+await broken.waitForTimeout(300);
+check(
+  !(await broken.locator('.gtt-refresh').isDisabled()),
+  'a sendMessage that throws does not leave the button disabled'
+);
+check(
+  /couldn't reach Google Calendar/.test(await broken.locator('.gtt-foot .gtt-note').innerText()),
+  `a failed refresh is reported instead of spinning (got "${await broken.locator('.gtt-foot .gtt-note').innerText()}")`
+);
+
+// --- 6e. the failsafe clears the spinner when nothing ever lands ----------
+const failsafePage = await browser.newPage();
+failsafePage.on('pageerror', (e) => errors.push(String(e)));
+await failsafePage.clock.install();
+await failsafePage.route('**/*', (r) => r.fulfill({ contentType: 'text/html', body: '<body></body>' }));
+await failsafePage.addInitScript(`
+  const localStore = {
+    gttDomWeeks: ${JSON.stringify({ [+cur]: [{ s: +at(cur, 0, 10), e: +at(cur, 0, 14), m: 'work' }] })},
+    gttDomWeeksAt: Date.now(),
+  };
+  window.chrome = {
+    storage: {
+      sync: {
+        get: async (d) => ({ ...d, source: 'dom', tracked: [{ name: 'work', target: 20 }] }),
+        set: async () => {},
+      },
+      local: {
+        get: async (k) => {
+          if (typeof k === 'string') return { [k]: localStore[k] };
+          if (Array.isArray(k)) return Object.fromEntries(k.map((key) => [key, localStore[key]]));
+          return { ...k, ...localStore };
+        },
+        set: async (o) => Object.assign(localStore, o),
+      },
+      onChanged: { addListener: () => {} },
+    },
+    runtime: {
+      getManifest: () => ({ version: '1.0.0' }),
+      sendMessage: () => Promise.resolve({ ok: true }),
+    },
+  };
+`);
+await failsafePage.goto('https://calendar.notion.so/');
+for (const f of ['vendor/ical.min.js', 'lib/hours.js', 'dom-reader.js', 'content.js']) {
+  await failsafePage.addScriptTag({ path: path.join(root, f) });
+}
+await failsafePage.addStyleTag({ path: path.join(root, 'content.css') });
+await failsafePage.waitForTimeout(200);
+await failsafePage.locator('.gtt-refresh').click();
+await failsafePage.waitForTimeout(150);
+check(await failsafePage.locator('.gtt-refresh').isDisabled(), 'failsafe case starts busy');
+await failsafePage.clock.runFor(13000);
+check(
+  !(await failsafePage.locator('.gtt-refresh').isDisabled()),
+  'the 12s failsafe clears the spinner when no data ever lands'
+);
+
 // Title parsing (pure function, fixed inputs)
 const nv = await notion.evaluate(() => ({
   sameMonth: +CalDom.notionViewDate('8 – 14 Jun 2026 · Notion Calendar'),
@@ -430,14 +760,6 @@ check(nv.crossYear === +new Date(2025, 11, 29), 'notion title "29 Dec 2025 – 4
 check(nv.monthView === null, 'notion month-view title returns null');
 
 // --- 6b. Notion follows the viewed week from the tab title -----------------
-const monNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-const notionTitle = (d1, d2) => {
-  if (d1.getFullYear() !== d2.getFullYear())
-    return `${d1.getDate()} ${monNames[d1.getMonth()]} ${d1.getFullYear()} – ${d2.getDate()} ${monNames[d2.getMonth()]} ${d2.getFullYear()} · Notion Calendar`;
-  if (d1.getMonth() !== d2.getMonth())
-    return `${d1.getDate()} ${monNames[d1.getMonth()]} – ${d2.getDate()} ${monNames[d2.getMonth()]} ${d1.getFullYear()} · Notion Calendar`;
-  return `${d1.getDate()} – ${d2.getDate()} ${monNames[d1.getMonth()]} ${d1.getFullYear()} · Notion Calendar`;
-};
 const prevWeekMon = at(cur, -7, 0);
 const prevWeekSun = at(cur, -1, 0);
 

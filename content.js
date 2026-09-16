@@ -10,6 +10,11 @@
   let lastRows = [];
   let domEventsRead = 0;
   let viewWeekTs = null; // week shown in the widget (dom mode follows the view)
+  let refreshBusy = false; // manual refresh in flight: drives the spinner and the note text
+  let refreshWeekTs = null; // week the manual refresh asked for, so only its data clears the spinner
+  let refreshError = false; // last manual refresh failed outright (dead context, no receiver)
+  let refreshTimer = null; // failsafe, armed at click time so it bounds the busy window
+  let refreshGen = 0; // generation counter: a stale failsafe must not clear a newer refresh
 
   // On Notion Calendar there is nothing to scan (its DOM is not supported
   // yet) — the widget renders from the data collected on calendar.google.com
@@ -44,6 +49,13 @@
     });
 
   const render = () => {
+    // The card is rebuilt on every render, so remember which control had focus
+    // and hand it back, else keyboard users lose their place in the widget.
+    const focused = document.activeElement?.classList?.contains('gtt-refresh')
+      ? 'refresh'
+      : document.activeElement?.classList?.contains('gtt-collapse')
+        ? 'collapse'
+        : null;
     root.textContent = '';
     const configured =
       settings.tracked.length && (settings.source === 'dom' || settings.icsUrls.length);
@@ -123,21 +135,56 @@
       card.appendChild(line);
     }
 
+    // Bottom row: where the data came from on the left, manual refresh in the corner.
+    const foot = document.createElement('div');
+    foot.className = 'gtt-foot';
     if (onNotion) {
       const note = document.createElement('div');
       note.className = 'gtt-note';
+      note.setAttribute('role', 'status');
       const hasViewData = ((domWeeks && domWeeks[viewWeekTs]) || []).length > 0;
-      note.textContent = hasViewData
-        ? `from Google Calendar · ${agoText(domWeeksAt)}`
-        : 'fetching this week from Google Calendar…';
-      card.appendChild(note);
+      note.textContent = refreshError
+        ? "couldn't reach Google Calendar"
+        : refreshBusy
+          ? 'refreshing from Google Calendar…'
+          : hasViewData
+            ? `from Google Calendar · ${agoText(domWeeksAt)}`
+            : 'fetching from Google Calendar…';
+      foot.appendChild(note);
     } else if (settings.source === 'dom') {
       const note = document.createElement('div');
       note.className = 'gtt-note';
-      note.textContent = `page mode · ${domEventsRead} events read in view`;
-      card.appendChild(note);
+      note.setAttribute('role', 'status');
+      note.textContent = refreshBusy
+        ? 'rescanning the grid…'
+        : refreshError
+          ? 'refresh failed'
+          : `page mode · ${domEventsRead} events read in view`;
+      foot.appendChild(note);
     }
+
+    const refreshBtn = document.createElement('button');
+    refreshBtn.className = refreshBusy ? 'gtt-refresh gtt-busy' : 'gtt-refresh';
+    refreshBtn.type = 'button';
+    refreshBtn.title = refreshBusy ? 'Refreshing…' : 'Refresh now';
+    refreshBtn.setAttribute('aria-label', refreshBusy ? 'Refreshing…' : 'Refresh now');
+    refreshBtn.setAttribute('aria-busy', String(refreshBusy));
+    refreshBtn.disabled = refreshBusy;
+    const refreshIcon = document.createElement('span');
+    refreshIcon.className = 'gtt-icon';
+    refreshIcon.setAttribute('aria-hidden', 'true');
+    refreshIcon.textContent = '↻';
+    refreshBtn.appendChild(refreshIcon);
+    refreshBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      manualRefresh();
+    });
+    foot.appendChild(refreshBtn);
+    card.appendChild(foot);
     root.appendChild(card);
+    if (focused === 'refresh') refreshBtn.focus();
+    else if (focused === 'collapse') collapse.focus();
   };
 
   const refreshIcs = async () => {
@@ -186,12 +233,17 @@
     if (Date.now() - (weekFetches.get(ts) || 0) < 5 * 60 * 1000) return;
     weekFetches.set(ts, Date.now());
     const d = new Date(ts);
-    chrome.runtime
-      .sendMessage?.({
-        type: 'gtt-refresh-gcal',
-        week: `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`,
-      })
-      ?.catch?.(() => {});
+    try {
+      chrome.runtime
+        .sendMessage?.({
+          type: 'gtt-refresh-gcal',
+          week: `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`,
+        })
+        ?.catch?.(() => {});
+    } catch {
+      // Extension context gone (reload/update): nothing to request, and a bare
+      // throw here would surface as an uncaught error on the host page.
+    }
   };
 
   const refreshNotion = async () => {
@@ -249,11 +301,76 @@
   const refresh = () =>
     onNotion ? refreshNotion() : settings.source === 'dom' ? refreshDom() : refreshIcs();
 
+  // Manual refresh from the widget. Same sources as the automatic path, but
+  // every throttle is skipped so one click really is one fresh pull: the
+  // background GCal tab is asked again, and the feed or grid is re-read now.
+  // Last known numbers stay on screen while it works.
+  const manualRefresh = async () => {
+    if (refreshBusy) return;
+    refreshBusy = true;
+    refreshError = false;
+    const gen = ++refreshGen;
+    // Arm the failsafe at click time, not inside the promise chain: a promise
+    // that never settles must not hold the button hostage, and the background
+    // worker's own give-up path takes 20s, longer than we want to spin.
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => {
+      if (refreshGen === gen && refreshBusy) {
+        refreshBusy = false;
+        render();
+      }
+    }, 12_000);
+    render();
+    try {
+      if (onNotion) {
+        await loadDomWeeks();
+        const ts = viewWeekTs ?? CalHours.weekStart(new Date()).getTime();
+        // Stamp the throttle instead of deleting it: this request is itself the
+        // fresh pull, so the automatic path must stay quiet for its 5 minutes
+        // rather than opening a second background tab on the same week.
+        weekFetches.set(ts, Date.now());
+        refreshWeekTs = ts;
+        const d = new Date(ts);
+        await chrome.runtime.sendMessage?.({
+          type: 'gtt-refresh-gcal',
+          week: `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`,
+        });
+        return; // fresh week data lands through onChanged and clears the spinner
+      }
+      if (settings.source === 'dom') await refreshDom();
+      else await refreshIcs();
+    } catch {
+      // Dead extension context, no receiving end, or a failed feed read: nothing
+      // is going to land, so stop spinning instead of waiting out the failsafe.
+      refreshError = true;
+    }
+    if (refreshGen === gen) {
+      if (refreshTimer) {
+        clearTimeout(refreshTimer);
+        refreshTimer = null;
+      }
+      refreshBusy = false;
+      render();
+    }
+  };
+
   chrome.storage.onChanged.addListener((changes, area) => {
     // A Google Calendar tab updated the shared week data — mirror it live.
     if (area === 'local' && changes.gttDomWeeks) {
-      domWeeks = changes.gttDomWeeks.newValue || {};
+      const incoming = changes.gttDomWeeks.newValue || {};
+      // Merge, never replace: another tab may hold a newer map for other weeks.
+      domWeeks = { ...domWeeks, ...incoming };
       if (changes.gttDomWeeksAt) domWeeksAt = changes.gttDomWeeksAt.newValue || 0;
+      // Stop the spinner only when the week we asked for actually arrived, so an
+      // unrelated week's write cannot end the pending state early.
+      if (refreshBusy && (refreshWeekTs === null || (incoming[refreshWeekTs] || []).length > 0)) {
+        if (refreshTimer) {
+          clearTimeout(refreshTimer);
+          refreshTimer = null;
+        }
+        refreshBusy = false;
+        refreshError = false;
+      }
       if (onNotion) refreshNotion();
       return;
     }
